@@ -160,6 +160,11 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut current_non_tool_block_index: Option<u32> = None;
         let mut tool_blocks_by_index: HashMap<usize, ToolBlockState> = HashMap::new();
         let mut open_tool_block_indices: HashSet<u32> = HashSet::new();
+        // Track whether any text or tool_use content blocks have been emitted.
+        // Used to synthesize a minimal text block for thinking-only responses
+        // (DeepSeek v4-pro etc. — see issue #3645).
+        let mut has_emitted_text_block = false;
+        let mut has_emitted_tool_block = false;
 
         tokio::pin!(stream);
 
@@ -177,6 +182,33 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                             if let Some(data) = strip_sse_field(l, "data") {
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
+
+                                    // Synthesize a minimal text block when the response
+                                    // contains ONLY thinking blocks (no text, no tool_use).
+                                    // See issue #3645.
+                                    if !has_emitted_text_block && !has_emitted_tool_block {
+                                        // Close open thinking block if any
+                                        if let Some(index) = current_non_tool_block_index.take() {
+                                            let event = json!({"type": "content_block_stop", "index": index});
+                                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                                        }
+                                        current_non_tool_block_type = None;
+
+                                        // Emit minimal empty text block
+                                        let text_idx = next_content_index;
+                                        next_content_index += 1;
+
+                                        let start = json!({"type": "content_block_start", "index": text_idx, "content_block": {"type": "text", "text": ""}});
+                                        yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", serde_json::to_string(&start).unwrap_or_default())));
+
+                                        let delta = json!({"type": "content_block_delta", "index": text_idx, "delta": {"type": "text_delta", "text": ""}});
+                                        yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", serde_json::to_string(&delta).unwrap_or_default())));
+
+                                        let stop = json!({"type": "content_block_stop", "index": text_idx});
+                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&stop).unwrap_or_default())));
+
+                                        log::debug!("[Claude/OpenRouter] >>> Synthesized empty text block for thinking-only response (#3645)");
+                                    }
 
                                     // 流正常结束，发出缓存的 message_delta（含完整 usage）。
                                     if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
@@ -324,6 +356,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 }
 
                                                 if let Some(index) = current_non_tool_block_index {
+                                                    has_emitted_text_block = true;
                                                     let event = json!({
                                                         "type": "content_block_delta",
                                                         "index": index,
@@ -446,6 +479,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                     };
 
                                                     if should_start {
+                                                        has_emitted_tool_block = true;
                                                         let event = json!({
                                                             "type": "content_block_start",
                                                             "index": anthropic_index,
@@ -554,6 +588,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 ));
                                             }
                                             late_tool_starts.sort_unstable_by_key(|(index, _, _, _)| *index);
+                                            has_emitted_tool_block = true;
                                             for (index, id, name, pending) in late_tool_starts {
                                                 let event = json!({
                                                     "type": "content_block_start",
@@ -629,6 +664,32 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         // 流自然结束但未收到 [DONE] 时，确保发送缓存的 message_delta 和 message_stop。
         // 若上游已显式报错，则只保留 error 事件，避免把失败伪装成成功完成。
         if !stream_ended_with_error {
+            // Synthesize a minimal text block when the response contains ONLY
+            // thinking blocks (no text, no tool_use). See issue #3645.
+            if !has_emitted_text_block && !has_emitted_tool_block {
+                // Close open thinking block if any
+                if let Some(index) = current_non_tool_block_index.take() {
+                    let event = json!({"type": "content_block_stop", "index": index});
+                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                }
+                current_non_tool_block_type = None;
+
+                // Emit minimal empty text block
+                let text_idx = next_content_index;
+                next_content_index += 1;
+
+                let start = json!({"type": "content_block_start", "index": text_idx, "content_block": {"type": "text", "text": ""}});
+                yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", serde_json::to_string(&start).unwrap_or_default())));
+
+                let delta = json!({"type": "content_block_delta", "index": text_idx, "delta": {"type": "text_delta", "text": ""}});
+                yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", serde_json::to_string(&delta).unwrap_or_default())));
+
+                let stop = json!({"type": "content_block_stop", "index": text_idx});
+                yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&stop).unwrap_or_default())));
+
+                log::debug!("[Claude/OpenRouter] >>> Synthesized empty text block for thinking-only response (#3645)");
+            }
+
             let emitted_pending_message_delta = if let Some((stop_reason, usage_json)) =
                 pending_message_delta.take()
             {
