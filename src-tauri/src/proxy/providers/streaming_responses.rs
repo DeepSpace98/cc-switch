@@ -433,7 +433,8 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                             "content_block": {
                                                 "type": "tool_use",
                                                 "id": call_id,
-                                                "name": name
+                                                "name": name,
+                                                "input": {}
                                             }
                                         });
                                         let sse = format!("event: content_block_start\ndata: {}\n\n",
